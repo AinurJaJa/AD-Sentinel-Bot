@@ -35,7 +35,6 @@ $ScriptName = "AD Sentinel Bot"
 
 Write-Host "🛡️ $ScriptName v$ScriptVersion - Starting Enhanced Monitoring" -ForegroundColor Cyan
 
-# Function to write log entries
 function Write-LogEntry {
     param(
         [string]$Message, 
@@ -44,26 +43,49 @@ function Write-LogEntry {
     
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $logEntry = "$timestamp [$Level] $Message"
+    static $lastMessage = $null
+    static $lastTimestamp = $null
+    $currentTime = Get-Date
     
+    if ($Message -eq $lastMessage -and 
+        $lastTimestamp -and 
+        ($currentTime - $lastTimestamp).TotalSeconds -lt 5) {
+        return
+    }
+    
+    $lastMessage = $Message
+    $lastTimestamp = $currentTime
     $color = switch($Level) {
-        "ERROR" { 'Red' }
-        "WARNING" { 'Yellow' }
-        "SUCCESS" { 'Green' }
-        "INFO" { 'Gray' }
-        "DEBUG" { 'DarkGray' }
-        default { 'White' }
+        "ERROR"    { 'Red' }
+        "WARNING"  { 'Yellow' }
+        "SUCCESS"  { 'Green' }
+        "INFO"     { 'Gray' }
+        "DEBUG"    { 'DarkGray' }
+        default    { 'White' }
     }
     
     Write-Host $logEntry -ForegroundColor $color
-    
-    # Ensure log directory exists
     $logDir = Join-Path $DataPath "Logs"
     if (-not (Test-Path $logDir)) {
         New-Item -ItemType Directory -Path $logDir -Force | Out-Null
     }
     
     $logFile = Join-Path $logDir "adsentinel_$(Get-Date -Format 'yyyyMMdd').log"
-    Add-Content -Path $logFile -Value $logEntry -ErrorAction SilentlyContinue
+    $oldLogs = Get-ChildItem -Path $logDir -Filter "adsentinel_*.log" | 
+               Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-30) }
+    
+    if ($oldLogs) {
+        $oldLogs | Remove-Item -Force -ErrorAction SilentlyContinue
+        Write-Host "$($oldLogs.Count) old log files removed (older than 30 days)" -ForegroundColor DarkGray
+    }
+    try {
+        Add-Content -Path $logFile -Value $logEntry -Encoding UTF8 -ErrorAction Stop
+    }
+    catch {
+        $tempLog = Join-Path $env:TEMP "adsentinel_fallback.log"
+        Write-Host "Failed to write to main log, using fallback: $tempLog" -ForegroundColor Yellow
+        Add-Content -Path $tempLog -Value $logEntry -Encoding UTF8 -ErrorAction SilentlyContinue
+    }
 }
 
 # Function to test AD connectivity
