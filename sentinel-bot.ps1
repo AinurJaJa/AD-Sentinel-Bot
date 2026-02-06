@@ -88,23 +88,96 @@ function Write-LogEntry {
     }
 }
 
-# Function to test AD connectivity
 function Test-ADConnectivity {
-    try {
-        Write-LogEntry "Testing Active Directory connectivity..." "DEBUG"
-        if ($UseLegacyADSNAPIN) {
-            $testResult = Get-QADObject -Identity "RootDSE" -ErrorAction Stop
-        } else {
-            $testResult = Get-ADDomain -ErrorAction Stop
-        }
-        Write-LogEntry "Active Directory connectivity test successful" "SUCCESS"
-        return $true
+    [CmdletBinding()]
+    param (
+        [string]$Domain = $env:USERDNSDOMAIN,
+        [int]$TimeoutSeconds = 10,
+        [switch]$DetailedOutput
+    )
+
+    begin {
+        Write-LogEntry "Starting Active Directory connectivity test..." "DEBUG"
+        $startTime = Get-Date
     }
-    catch {
-        Write-LogEntry "Active Directory connectivity test failed: $($_.Exception.Message)" "ERROR"
-        return $false
+
+    process {
+        try {
+            Write-LogEntry "Checking DNS resolution for domain: $Domain" "DEBUG"
+            $dnsResult = Resolve-DnsName -Name $Domain -Type A -ErrorAction Stop
+            Write-LogEntry "DNS resolution successful: $($dnsResult.IPAddress -join ', ')" "SUCCESS"
+            if ($UseLegacyADSNAPIN) {
+                Write-LogEntry "Using legacy QAD cmdlets for AD connectivity test" "DEBUG"
+                $testResult = Get-QADObject -Identity "RootDSE" -Timeout $TimeoutSeconds -ErrorAction Stop
+            }
+            else {
+                Write-LogEntry "Using ActiveDirectory module for AD connectivity test" "DEBUG"
+                if (-not (Get-Module -Name ActiveDirectory -ListAvailable)) {
+                    throw "ActiveDirectory module is not installed or available"
+                }
+                $params = @{
+                    ErrorAction = 'Stop'
+                    Server = $Domain
+                }
+                if ($TimeoutSeconds) {
+                    $params['Timeout'] = $TimeoutSeconds
+                }
+                
+                $testResult = Get-ADDomain @params
+            }
+
+            $endTime = Get-Date
+            $duration = [math]::Round(($endTime - $startTime).TotalSeconds, 2)
+
+            Write-LogEntry "Active Directory connectivity test successful (duration: $duration sec)" "SUCCESS"
+            
+            if ($DetailedOutput) {
+                return @{
+                    Success = $true
+                    Domain = $testResult.Name
+                    Forest = $testResult.Forest
+                    DomainMode = $testResult.DomainMode
+                    PDCEmulator = $testResult.PDCEmulator
+                    Duration = $duration
+                    Timestamp = $endTime
+                }
+            }
+            else {
+                return $true
+            }
+        }
+        catch {
+            $endTime = Get-Date
+            $duration = [math]::Round(($endTime - $startTime).TotalSeconds, 2)
+            
+            $errorMessage = $_.Exception.Message
+            if ($_.Exception.InnerException) {
+                $errorMessage += " | Inner: $($_.Exception.InnerException.Message)"
+            }
+
+            Write-LogEntry "Active Directory connectivity test failed after $duration sec: $errorMessage" "ERROR"
+            Write-LogEntry "Exception type: $($_.Exception.GetType().FullName)" "DEBUG"
+
+            if ($DetailedOutput) {
+                return @{
+                    Success = $false
+                    Error = $errorMessage
+                    ExceptionType = $_.Exception.GetType().FullName
+                    Duration = $duration
+                    Timestamp = $endTime
+                }
+            }
+            else {
+                return $false
+            }
+        }
+    }
+
+    end {
+        Write-LogEntry "AD connectivity test completed" "DEBUG"
     }
 }
+
 
 # Function to initialize AD connection
 function Initialize-ADConnection {
