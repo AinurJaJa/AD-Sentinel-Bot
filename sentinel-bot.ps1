@@ -722,99 +722,124 @@ Please do not reply to this message.
     }
 }
 
-# Main execution flow
 try {
-    # Initialize environment
     Write-LogEntry "Initializing enhanced monitoring environment..." "INFO"
-    
+
     $snapshotsPath = Join-Path $DataPath "Snapshots"
     $changesPath = Join-Path $DataPath "ChangeHistory"
     $reportsPath = Join-Path $DataPath "Reports"
     $logsPath = Join-Path $DataPath "Logs"
-    
-    # Create required directories
-    @($DataPath, $snapshotsPath, $changesPath, $reportsPath, $logsPath) | ForEach-Object {
-        if (-not (Test-Path $_)) {
-            New-Item -ItemType Directory -Path $_ -Force | Out-Null
-            Write-LogEntry "Created directory: $_" "INFO"
+    $directories = @($DataPath, $snapshotsPath, $changesPath, $reportsPath, $logsPath)
+    foreach ($dir in $directories) {
+        if (-not (Test-Path $dir)) {
+            try {
+                New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null
+                Write-LogEntry "Created directory: $dir" "INFO"
+            }
+            catch {
+                Write-LogEntry "Failed to create directory $dir: $($_.Exception.Message)" "ERROR"
+                exit 1
+            }
         }
     }
-    
-    # Initialize AD connection
-    Initialize-ADConnection
-    
-    # Test AD connectivity
-    if (-not (Test-ADConnectivity)) {
+    if (-not (Initialize-ADConnection -Timeout 30)) {
+        Write-LogEntry "AD connection initialization failed. Stopping execution." "ERROR"
+        exit 1
+    }
+
+    if (-not (Test-ADConnectivity -Timeout 15)) {
         Write-LogEntry "Active Directory connectivity test failed. Stopping execution." "ERROR"
         exit 1
     }
-    
-    # Process each target group
+    $totalGroups = $GroupNames.Count
+    $processedGroups = 0
+    $changedGroups = 0
+
     foreach ($groupName in $GroupNames) {
-        Write-LogEntry "Processing group: $groupName" "INFO"
-        
-        $resolvedGroup = Resolve-ADGroup -GroupIdentifier $groupName
-        if (-not $resolvedGroup) {
-            Write-LogEntry "Skipping unresolved group: $groupName" "WARNING"
+        $processedGroups++
+        Write-LogEntry "Processing group $processedGroups/$totalGroups: $groupName" "INFO"
+
+        try {
+            $resolvedGroup = Resolve-ADGroup -GroupIdentifier $groupName -ErrorAction Stop
+            if (-not $resolvedGroup) {
+                Write-LogEntry "Skipping unresolved group: $groupName" "WARNING"
+                continue
+            }
+            try {
+                $currentMembers = Get-GroupMembershipSnapshot -ADGroup $resolvedGroup -ErrorAction Stop
+                Write-LogEntry "Current members in '$($resolvedGroup.Name)': $($currentMembers.Count)" "INFO"
+            }
+            catch {
+                Write-LogEntry "Failed to get membership snapshot for group '$groupName': $($_.Exception.Message)" "ERROR"
+                continue
+            }
+            $previousMembers = Load-PreviousSnapshot -ADGroup $resolvedGroup -StoragePath $snapshotsPath
+
+            $hasChanges = $false
+            if ($previousMembers) {
+                $changes = Compare-GroupSnapshots -CurrentSnapshot $currentMembers -PreviousSnapshot $previousMembers
+
+                if ($changes.Count -gt 0) {
+                    $hasChanges = $true
+                    $changedGroups++
+                    Write-LogEntry "Changes detected in group '$($resolvedGroup.Name)': $($changes.Count)" "WARNING"
+                    try {
+                        $reportFile = New-ChangeReport -GroupName $resolvedGroup.Name -Changes $changes -ReportPath $reportsPath -ErrorAction Stop
+                    }
+                    catch {
+                        Write-LogEntry "Failed to create change report for group '$($resolvedGroup.Name)'" "ERROR"
+                        $reportFile = $null
+                    }
+                    if ($EnableEmailNotifications) {
+                        try {
+                            Send-ChangeNotification -GroupName $resolvedGroup.Name -Changes $changes -ReportFile $reportFile -ErrorAction Stop
+                        }
+                        catch {
+                            Write-LogEntry "Failed to send email notification for group '$($resolvedGroup.Name)'" "ERROR"
+                        }
+                    }
+                    foreach ($change in $changes) {
+                        $icon = if ($change.ChangeType -eq "MemberAdded") { "➕" } else { "➖" }
+                        Write-LogEntry "$icon $($change.ChangeType): $($change.Member.SamAccountName) ($($change.Member.DisplayName))" "INFO"
+                    }
+                    $changeRecord = @{
+                        Group = $resolvedGroup.Name
+                        GroupSID = $resolvedGroup.SID.Value
+                        DetectedAt = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                        Changes = $changes
+                        ReportFile = if ($reportFile) { [System.IO.Path]::GetFileName($reportFile) } else { "N/A" }
+                    }
+
+                    $changeFile = Join-Path $changesPath "$($resolvedGroup.Name)_changes_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
+                    $changeRecord | ConvertTo-Json -Depth 4 | Out-File $changeFile -Encoding UTF8
+                    Write-LogEntry "Change record saved: $changeFile" "INFO"
+                }
+                else {
+                    Write-LogEntry "No changes detected in group: $($resolvedGroup.Name)" "SUCCESS"
+                }
+            }
+            else {
+                Write-LogEntry "Initial snapshot captured for group: $($resolvedGroup.Name)" "INFO"
+            }
+            try {
+                $snapshotFile = Save-GroupSnapshot -ADGroup $resolvedGroup -Snapshot $currentMembers -StoragePath $snapshotsPath -ErrorAction Stop
+                Write-LogEntry "Snapshot saved for next comparison: $snapshotFile" "DEBUG"
+            }
+            catch {
+                Write-LogEntry "Failed to save snapshot for group '$($resolvedGroup.Name)'" "ERROR"
+            }
+        }
+        catch {
+            Write-LogEntry "Error processing group '$groupName': $($_.Exception.Message)" "ERROR"
             continue
         }
-        
-        # Capture current state
-        $currentMembers = Get-GroupMembershipSnapshot -ADGroup $resolvedGroup
-        Write-LogEntry "Current members in '$($resolvedGroup.Name)': $($currentMembers.Count)" "INFO"
-        
-        # Load previous state
-        $previousMembers = Load-PreviousSnapshot -ADGroup $resolvedGroup -StoragePath $snapshotsPath
-        
-        if ($previousMembers) {
-            # Compare and detect changes
-            $changes = Compare-GroupSnapshots -CurrentSnapshot $currentMembers -PreviousSnapshot $previousMembers
-            
-            if ($changes.Count -gt 0) {
-                Write-LogEntry "Changes detected in group '$($resolvedGroup.Name)': $($changes.Count)" "WARNING"
-                
-                # Create detailed HTML report
-                $reportFile = New-ChangeReport -GroupName $resolvedGroup.Name -Changes $changes -ReportPath $reportsPath
-                
-                # Send email notification
-                Send-ChangeNotification -GroupName $resolvedGroup.Name -Changes $changes -ReportFile $reportFile
-                
-                # Log individual changes
-                foreach ($change in $changes) {
-                    $icon = if ($change.ChangeType -eq "MemberAdded") { "➕" } else { "➖" }
-                    Write-LogEntry "$icon $($change.ChangeType): $($change.Member.SamAccountName) ($($change.Member.DisplayName))" "INFO"
-                }
-                
-                # Save change record
-                $changeRecord = @{
-                    Group = $resolvedGroup.Name
-                    GroupSID = $resolvedGroup.SID.Value
-                    DetectedAt = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-                    Changes = $changes
-                    ReportFile = if ($reportFile) { [System.IO.Path]::GetFileName($reportFile) } else { "N/A" }
-                }
-                
-                $changeFile = Join-Path $changesPath "$($resolvedGroup.Name)_changes_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
-                $changeRecord | ConvertTo-Json -Depth 4 | Out-File $changeFile -Encoding UTF8
-                Write-LogEntry "Change record saved: $changeFile" "INFO"
-                
-            } else {
-                Write-LogEntry "No changes detected in group: $($resolvedGroup.Name)" "SUCCESS"
-            }
-        } else {
-            Write-LogEntry "Initial snapshot captured for group: $($resolvedGroup.Name)" "INFO"
-        }
-        
-        # Save current snapshot for next comparison
-        $snapshotFile = Save-GroupSnapshot -ADGroup $resolvedGroup -Snapshot $currentMembers -StoragePath $snapshotsPath
-        Write-LogEntry "Snapshot saved for next comparison: $snapshotFile" "DEBUG"
     }
-    
     Write-LogEntry "Enhanced monitoring cycle completed successfully!" "SUCCESS"
+    Write-LogEntry "Processed $processedGroups groups, $changedGroups had changes" "INFO"
     Write-LogEntry "Reports available in: $reportsPath" "INFO"
     Write-LogEntry "Logs available in: $logsPath" "INFO"
-    
-} catch {
+}
+catch {
     Write-LogEntry "Monitoring failed: $($_.Exception.Message)" "ERROR"
     Write-LogEntry "Stack trace: $($_.ScriptStackTrace)" "DEBUG"
     exit 1
